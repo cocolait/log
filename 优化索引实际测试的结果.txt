@@ -1,0 +1,96 @@
+MySQL优化日志
+
+MYSQL 使用explain 查看性能分析
+
+MySQL索引级别
+从最好到最差的类型为system > const > eq_ref > ref > fulltext > ref_or_null > index_merge > unique_subquery > index_subquery > range > index > ALL。
+一般来说，type至少要达到range级别，最好达到ref级别，低于range级别的sql必须进行优化。
+
+key: 显示sql执行过程中实际使用的键或索引，如果为null则表示未使用任何索引，必须进行优化。
+
+1.where in 性能分析
+测试语句 SELECT * FROM `pz_member_payment_order` WHERE  `type` IN (21,22,23,24,25,26,28,29,2,3,4,5,6,9,10) ORDER BY `id` DESC LIMIT 0,20
+mysql不是你设置了索引就会用 就比如这条 我设置type为普通的索引 可性能分析显示的主键索引 可能是级别不够高 总体来说 in 性能不高
+如果主键的话 会使用到 不过性能级别不高 range 属于正常
+测试语句 ：SELECT * FROM `pz_member_payment_order` WHERE  `id` IN (21,22,23,24,25,26,28,29,2,3,4,5,6,9,10) ORDER BY `id` DESC LIMIT 0,20
+
+2.count(1),count(*),count(index)的速度对比 （165W数据）
+count(1) SELECT COUNT(1) AS tp_count FROM `pz_system_log` `l` 测试时间 时间: 0.183s
+count(*) SELECT COUNT(1) AS tp_count FROM `pz_system_log` `l` 测试时间 时间: 0.183s
+count(index) SELECT COUNT(`l`.`id`) AS tp_count FROM `pz_system_log` `l`  测试时间 时间: 0.202s
+在更大的数据上 对比 count(1) 会比 其他2个快 不过本身的性能还是差 可能是mysql本身机制问题 
+对了还有limit 也有一样的情况 limit值越大时,也会随之性能下降 值越大性能越差 查询耗时更久
+
+3.在使用jion链表的情况 查询
+模拟数据 165W
+附表没有使用主键索引查询的情况
+测试sql：
+SELECT `l`.*,`u`.`username`,`u`.`nick` 
+FROM `pz_system_log` `l` LEFT JOIN `pz_system_user` `u` ON `u`.`id`=`l`.`uid`  
+ORDER BY `mtime` DESC LIMIT 0,20 
+测试时间 [4.694s]
+
+附表使用主键索引查询的情况
+SELECT `l`.*,`u`.`username`,`u`.`nick` 
+FROM `pz_system_log` `l` LEFT JOIN `pz_system_user` `u` ON `u`.`id`=`l`.`uid` 
+WHERE  `u`.`id` > '0' 
+ORDER BY `mtime` DESC LIMIT 0,20 
+测试时间 [0.000983s]
+
+这个性能相差是不是很大
+
+4.多表查询 count() 和 单表查询 count() 性能对比
+同样是165W数据
+
+首先是不附带任何条件的情况
+多表查询 count() 
+测试sql:SELECT COUNT(1) AS tp_count FROM `pz_system_log` `l` LEFT JOIN `pz_system_user` `u` ON `u`.`id`=`l`.`uid`
+测试时间：1.069s
+
+单表查询 count()
+测试SQL：SELECT COUNT(1) AS tp_count FROM `pz_system_log`;
+测试时间：0.208s
+
+附带条件的情况 【不附带副表的条件】
+多表查询 count()
+测试sql:
+ SELECT COUNT(1) AS tp_count
+ FROM `pz_system_log` `l` LEFT JOIN `pz_system_user` `u` ON `u`.`id`=`l`.`uid` 
+WHERE  `u`.`id` > '0'  AND `l`.`mtime` BETWEEN '1569859200' AND '1570636800'
+
+测试时间:0.807s
+
+单表查询 count()
+SELECT COUNT(1) AS tp_count
+ FROM `pz_system_log` `l` 
+WHERE  `l`.`mtime` BETWEEN '1569859200' AND '1570636800'
+
+测试时间：0.384s
+
+附带条件的情况 【附带副表的条件】
+多表查询 count()
+测试sql:
+SELECT COUNT(1) AS tp_count 
+FROM `pz_system_log` `l` LEFT JOIN `pz_system_user` `u` ON `u`.`id`=`l`.`uid` 
+WHERE  `u`.`id` > '0'  AND `l`.`mtime` BETWEEN '1569859200' AND '1570636800'   AND `u`.`username` = 'admin'
+
+测试时间 5.158s
+
+单表查询 count()
+无法进行 因为没有附表的条件
+
+总结:count()在百万级别数据量中 单表查询性能还算Ok 多表在不使用副表条件的情况 也还算OK 不过 使用的条件必须要建议索引的前提下
+经过测试 在使用索引条件的情况下 性能还是相当OK的 链表没有问题 不过切记
+在链表查询中一定要附带副表的主键索引 不然性能差距会相当明显 查询条件如果是不考虑分页不考虑count的情况下 性能影响很小  如果要考虑
+分页那么条件就得有规划 不能乱用条件 能不用副表的条件 就尽量避免不要用 不然性能损耗会比较明显
+
+5.where like
+like需要特殊使用才能正确的用到索引
+只有index%才会使用上索引 其他的 像 %index% 或者 %index 都不会使用上索引条件
+测试SQL：SELECT * FROM `pz_member_payment_order` WHERE  `order_id` LIKE '2019100720233222196611221%' ORDER BY `id` DESC LIMIT 0,20
+
+6.优化索引的同时 字段的类型也是影响性能查询的一部分 所以要建立最合适的字段长度 和 类型
+时间类型字段 timestamp 性能查询会比datetime要快一些
+MySQL在选择索引的时候 内部也会检测字段类型 经过多次 mysql在真实使用索引的时候 也会优先选择字段类型值 最小的那个索引 最优选
+
+7.在千万数据中 order by排序 选择不同的字段 查询性能相差很大 当数据量过大时,如再有时间范围的条件  有时间索引 和 主键索引 选择时间索引要比主键索引快很多
